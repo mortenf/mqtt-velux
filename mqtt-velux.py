@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #coding:utf-8
 
-import getopt, asyncio, json, sys, configparser, signal, logging
+import getopt, asyncio, json, sys, configparser, signal, logging, re
 from pyvlx import PyVLX, Position, UnknownPosition, PyVLXException, OpeningDevice
 from time import sleep
 import paho.mqtt.client as mqtt
@@ -11,7 +11,7 @@ __usage__ = """
  options are:
   -h or --help      display this help
   -v or --verbose   increase amount of reassuring messages
-  -d or --debug     maximum verbosity published to mqtt debug topic
+  -d or --debug     maximum verbosity published to mqtt topics
 """
 
 class DebugStreamHandler(logging.StreamHandler):
@@ -23,8 +23,10 @@ class DebugStreamHandler(logging.StreamHandler):
             return
         self.format(record)
         try:
-            topic = config.get("mqtt", "response") + "/" + record.levelname.lower()
-            sub.publish(topic, record.message, retain=eval(config.get("mqtt", "retain")))
+            sub.publish(
+                config.get("mqtt", "response") + "/mqtt-velux/system/" + record.levelname.lower(),
+                record.message,
+                retain=eval(config.get("mqtt", "retain")))
         except Exception as e:
             print(e)
 
@@ -35,32 +37,30 @@ config = {}
 sub = {}
 vlx = {}
 done = 0
-q = []
 
 def on_mqtt_connect(client, userdata, flags, rc):
     logger.warning("mqtt connected with result code "+str(rc))
-    # Subscribing in on_connect() means that if we lose the connection and
-    # reconnect then subscriptions will be renewed.
     client.subscribe(config.get("mqtt", "prefix") + "/#")
 
-def on_mqtt_message(client, userdata, msg):
+def on_mqtt_message(client, loop, msg):
     try:
         device = msg.topic.split(config.get("mqtt", "prefix") + "/", 1)[1]
-        response = config.get("mqtt", "response") + "/" + device
         if device == "echo":
-            q.append((None, msg.payload.decode('utf-8'), response))
+            sub.publish(
+                config.get("mqtt", "response") + "/echo",
+                msg.payload.decode('utf-8'),
+                retain=eval(config.get("mqtt", "retain")))
             return
         payload = msg.payload.decode('utf-8').lower()
         logger.info("message received @%s: %s" % (msg.topic, payload))
-        node = device.replace("/", "-")
+        node = re.sub("-position$", "", device.replace("/", "-"))
         if not node in vlx.nodes:
             raise Exception("unknown node: " + node)
-        logger.info("queueing request @%s: %s" % (node, payload))
-        q.append((node, payload, None))
+        asyncio.run_coroutine_threadsafe(vlx_set_position(node, payload), loop)
     except Exception as msg:
         logger.error(msg)
 
-async def vlx_set_position(node, pos, response):
+async def vlx_set_position(node, pos):
     if pos == "close":
         pos = "closed"
     pct = 0 if pos == "open" else 100 if pos == "closed" else eval(pos) if pos.isdigit() else None
@@ -78,9 +78,11 @@ async def on_device_updated(node):
         return
     pct = node.position.position_percent
     msg = "open" if pct == 0 else "closed" if pct == 100 else str(pct)
-    topic = config.get("mqtt", "response") + "/" + node.name.replace("-", "/")
     logger.info("device updated: %s = %s" % (node.name, msg))
-    sub.publish(topic, msg, retain=eval(config.get("mqtt", "retain")))
+    sub.publish(
+        config.get("mqtt", "response") + "/" + node.name.replace("-", "/") + "/position",
+        msg,
+        retain=eval(config.get("mqtt", "retain")))
 
 async def main(loop):
     global parms, config, logger, sub, vlx, done
@@ -112,47 +114,49 @@ async def main(loop):
         logger.error("at least 1 argument required")
         logger.error(__usage__)
         return 2
-    cfgfile = args.pop(0)
+    # read config
     config = configparser.ConfigParser()
     config.optionxform = str
-    config.read(cfgfile)
+    config.read(args.pop(0))
 
-    sub = mqtt.Client()
+    # mqtt
+    sub = mqtt.Client(userdata=loop)
     sub.on_connect = on_mqtt_connect
     sub.on_message = on_mqtt_message
     if eval(config.get("mqtt", "auth")):
         sub.username_pw_set(config.get("mqtt", "user"), config.get("mqtt", "password"))
     sub.connect(config.get("mqtt", "hostname"), eval(config.get("mqtt", "port")), 60)
     sub.loop_start()
-    #sleep(0.5)
 
+    # velux
     if not done:
         vlx = PyVLX(host=config.get("velux", "hostname"), password=config.get("velux", "password"), loop=loop)
-
         nodes = []
         await vlx.load_nodes()
         for n in vlx.nodes:
             n.register_device_updated_cb(on_device_updated)
             logger.info(str(n))
             nodes.append(n.name)
-        logger.info("started: " + ", ".join(nodes))
-        sub.publish(config.get("mqtt", "response") + "/info", "started: " + ", ".join(nodes), retain=eval(config.get("mqtt", "retain")))
+        nodes = ", ".join(nodes)
+        logger.info("started: " + nodes)
+        sub.publish(
+            config.get("mqtt", "response") + "/mqtt-velux/system/message",
+            "started: " + nodes,
+            retain=eval(config.get("mqtt", "retain")))
 
     logger.info("looping...")
     while not done:
         await asyncio.sleep(0.1)
-        if len(q) > 0:
-            node, pos, response = q.pop(0)
-            if node is not None:
-                await vlx_set_position(node, pos, response)
-            if response is not None:
-                sub.publish(response, pos, retain=eval(config.get("mqtt", "retain")))
-    sub.loop_stop()
 
+    logger.info("done.")
+    sub.loop_stop()
     await vlx.disconnect()
 
-    sub.publish(config.get("mqtt", "response") + "/info", "ended.", retain=eval(config.get("mqtt", "retain")))
-    logger.info("done.")
+    sub.publish(
+        config.get("mqtt", "response") + "/mqtt-velux/system/message",
+        "ended.",
+        retain=eval(config.get("mqtt", "retain")))
+    logger.info("ended.")
 
 def signal_handler(signum, frame):
     global done
@@ -171,4 +175,3 @@ if __name__ == '__main__':
         logger.error(msg)
         raise
     LOOP.close()
-    logger.info("ended.")
