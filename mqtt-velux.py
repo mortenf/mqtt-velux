@@ -1,20 +1,36 @@
-#!/usr/bin/env python3.6
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+#coding:utf-8
 
 import getopt, asyncio, json, sys, configparser, signal, logging
-from pyvlx import PyVLX, Position, PyVLXException
+from pyvlx import PyVLX, Position, UnknownPosition, PyVLXException, OpeningDevice
 from time import sleep
 import paho.mqtt.client as mqtt
 
 __usage__ = """
  usage: python mqtt-velux.py [options] configuration_file
  options are:
-  -h or --help     display this help
-  -v or --verbose  increase amount of reassuring messages
+  -h or --help      display this help
+  -v or --verbose   increase amount of reassuring messages
+  -d or --debug     maximum verbosity published to mqtt debug topic
 """
 
+class DebugStreamHandler(logging.StreamHandler):
+    def __init__(self):
+        logging.StreamHandler.__init__(self)
+    def emit(self, record):
+        if not parms["debug"]:
+            logging.StreamHandler.emit(self, record)
+            return
+        self.format(record)
+        try:
+            topic = config.get("mqtt", "response") + "/" + record.levelname.lower()
+            sub.publish(topic, record.message, retain=eval(config.get("mqtt", "retain")))
+        except Exception as e:
+            print(e)
+
 logger = logging.getLogger('pyvlx')
-logging.basicConfig(format='%(asctime)s %(message)s')
+logging.basicConfig(format='%(asctime)s %(message)s',handlers=[DebugStreamHandler()])
+parms = {}
 config = {}
 sub = {}
 vlx = {}
@@ -40,7 +56,7 @@ def on_mqtt_message(client, userdata, msg):
         if not node in vlx.nodes:
             raise Exception("unknown node: " + node)
         logger.info("queueing request @%s: %s" % (node, payload))
-        q.append((node, payload, response))
+        q.append((node, payload, None))
     except Exception as msg:
         logger.error(msg)
 
@@ -52,24 +68,38 @@ async def vlx_set_position(node, pos, response):
         logger.error("invalid position for @%s: %s" % (node, pos))
         return
     logger.info("setting position @%s: %s" % (node, pct))
-    await vlx.nodes[node].set_position(Position(position_percent=pct), wait_for_completion=True)
-    logger.info("new position @%s: %s" % (node, pos))
-    sub.publish(response, pos, retain=eval(config.get("mqtt", "retain")))
+    await vlx.nodes[node].set_position(Position(position_percent=pct), wait_for_completion=False)
+
+async def on_device_updated(node):
+    if not isinstance(node, OpeningDevice):
+        return
+    if node.position == UnknownPosition():
+        logger.info("device position unknown: %s" % node.name)
+        return
+    pct = node.position.position_percent
+    msg = "open" if pct == 0 else "closed" if pct == 100 else str(pct)
+    topic = config.get("mqtt", "response") + "/" + node.name.replace("-", "/")
+    logger.info("device updated: %s = %s" % (node.name, msg))
+    sub.publish(topic, msg, retain=eval(config.get("mqtt", "retain")))
 
 async def main(loop):
-    global config, logger, sub, vlx, done
+    global parms, config, logger, sub, vlx, done
     logger.setLevel(logging.ERROR)
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hv", ['help', 'verbose'])
+        opts, args = getopt.getopt(sys.argv[1:], "dhv", ['debug', 'help', 'verbose'])
     except getopt.error as msg:
         print(msg)
         print(__usage__)
         return 1
     # process options
+    parms["debug"] = False
     for o, a in opts:
         if o == '-h' or o == '--help':
             print(__usage__)
             return 0
+        if o == '-d' or o == '--debug':
+            parms["debug"] = True
+            logger.setLevel(logging.DEBUG)
         elif o == '-v' or o == '--verbose':
             if logger.getEffectiveLevel() == logging.ERROR:
                 logger.setLevel(logging.WARNING)
@@ -83,7 +113,7 @@ async def main(loop):
         logger.error(__usage__)
         return 2
     cfgfile = args.pop(0)
-    config = configparser.SafeConfigParser()
+    config = configparser.ConfigParser()
     config.optionxform = str
     config.read(cfgfile)
 
@@ -94,7 +124,7 @@ async def main(loop):
         sub.username_pw_set(config.get("mqtt", "user"), config.get("mqtt", "password"))
     sub.connect(config.get("mqtt", "hostname"), eval(config.get("mqtt", "port")), 60)
     sub.loop_start()
-    sleep(0.5)
+    #sleep(0.5)
 
     if not done:
         vlx = PyVLX(host=config.get("velux", "hostname"), password=config.get("velux", "password"), loop=loop)
@@ -102,55 +132,43 @@ async def main(loop):
         nodes = []
         await vlx.load_nodes()
         for n in vlx.nodes:
+            n.register_device_updated_cb(on_device_updated)
             logger.info(str(n))
             nodes.append(n.name)
-        logger.info("nodes: " + ", ".join(nodes))
-        sub.publish(config.get("mqtt", "response") + "/system", "started: " + ", ".join(nodes), retain=eval(config.get("mqtt", "retain")))
+        logger.info("started: " + ", ".join(nodes))
+        sub.publish(config.get("mqtt", "response") + "/info", "started: " + ", ".join(nodes), retain=eval(config.get("mqtt", "retain")))
 
     logger.info("looping...")
     while not done:
-        sleep(0.5)
+        await asyncio.sleep(0.1)
         if len(q) > 0:
             node, pos, response = q.pop(0)
             if node is not None:
                 await vlx_set_position(node, pos, response)
-                continue
-            nodes = []
-            try:
-                await vlx.load_nodes()
-            except PyVLXException as msg:
-                logger.error(msg)
-                done = 1
-                continue
-            for n in vlx.nodes:
-                nodes.append(n.name)
-            sub.publish(response, pos, retain=eval(config.get("mqtt", "retain")))
+            if response is not None:
+                sub.publish(response, pos, retain=eval(config.get("mqtt", "retain")))
     sub.loop_stop()
 
     await vlx.disconnect()
 
-    sub.publish(config.get("mqtt", "response") + "/system", "ended.", retain=eval(config.get("mqtt", "retain")))
+    sub.publish(config.get("mqtt", "response") + "/info", "ended.", retain=eval(config.get("mqtt", "retain")))
     logger.info("done.")
 
 def signal_handler(signum, frame):
     global done
     signame = signal.Signals(signum).name
     logger.error("%s received" % signame)
-    #if signum == signal.SIGHUP:
-    #    reload = 1
     done = 1
 
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGHUP, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    # pylint: disable=invalid-name
     try:
         LOOP = asyncio.get_event_loop()
         LOOP.run_until_complete(main(LOOP))
     except Exception as msg:
         logger.error(msg)
         raise
-    # LOOP.run_forever()
     LOOP.close()
     logger.info("ended.")
